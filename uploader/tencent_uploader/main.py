@@ -622,21 +622,46 @@ class TencentBaseUploader(BaseVideoUploader):
                 await element.click()
                 break
 
-        time_input = page.locator('input[placeholder="请选择时间"]')
-        await time_input.click()
-        await page.keyboard.press("Control+KeyA")
-        # 旧版这里原先只敲小时，分钟被丢弃(11:45 → 11:00)；改敲完整 HH:MM
-        await page.keyboard.type(publish_date.strftime("%H:%M"))
-        await page.keyboard.press("Enter")
+        # weui 时间控件是时/分两列下拉(ol li)，不吃键盘输入；且页面常驻两份
+        # dl.weui-desktop-picker__time，第一份是隐藏废件——locator.first 永远点到
+        # 隐藏那份导致所有操作落空(打字后值纹丝不动)。必须只操作可见的那份。
+        # (结构与坑位参考 DevilJie/social-auto-upload-web-ui weixin_gzh 的实测文档)
+        import re as _re
+        hour = publish_date.strftime("%H")
+        minute = publish_date.strftime("%M")
+
+        time_dl = page.locator("dl.weui-desktop-picker__time:visible").first
+        if not await time_dl.count():
+            raise RuntimeError("找不到可见的时间选择控件 dl.weui-desktop-picker__time")
+        await time_dl.locator('input[placeholder="请选择时间"]').click()
         await page.wait_for_timeout(500)
-        # 收起时间选择浮层：直接点描述区可能被 weui-desktop-dialog 遮挡，做容错
+
+        hour_li = time_dl.locator("ol.weui-desktop-picker__time__hour li").filter(
+            has_text=_re.compile(rf"^{hour}$")
+        ).first
+        if not await hour_li.count():
+            raise RuntimeError(f"时间下拉里找不到小时项 {hour}")
+        await hour_li.click()
+        await page.wait_for_timeout(300)
+
+        minute_li = time_dl.locator("ol.weui-desktop-picker__time__minute li").filter(
+            has_text=_re.compile(rf"^{minute}$")
+        ).first
+        if not await minute_li.count():
+            raise RuntimeError(f"时间下拉里找不到分钟项 {minute}")
+        await minute_li.click()
+        await page.wait_for_timeout(300)
+
+        # 点组件外空白收起面板，时分才生效
         try:
             await page.locator("div.input-editor").click(timeout=5000)
         except Exception:
             await page.keyboard.press("Escape")
-        # 读回校验，分钟对不上就报错(旧版下拉可能只有整点/半点档位)
-        actual = (await time_input.input_value()).strip()
-        expect_time = publish_date.strftime("%H:%M")
+        await page.wait_for_timeout(500)
+
+        # 读回校验（只认可见那份 input），对不上就报错退出
+        actual = (await time_dl.locator('input[placeholder="请选择时间"]').input_value()).strip()
+        expect_time = f"{hour}:{minute}"
         if actual != expect_time:
             raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，输入框值 {actual!r}，期望 {expect_time!r}")
         tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {actual}"))
