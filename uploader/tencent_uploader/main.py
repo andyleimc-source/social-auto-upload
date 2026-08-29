@@ -906,7 +906,24 @@ class TencentBaseUploader(BaseVideoUploader):
                     except Exception:
                         await publish_btn.evaluate("el => el.click()")
                 if is_draft:
-                    await page.wait_for_url("**/post/list**", timeout=5000)
+                    # 保存草稿后页面不一定跳转 post/list（实测 2026-08-29 草稿已存但停在原页），
+                    # 综合判断：URL 跳走 或 「保存草稿」按钮消失/不可见 都算成功
+                    saved = False
+                    for _ in range(10):
+                        await asyncio.sleep(1)
+                        cur = page.url
+                        if "post/list" in cur or "draft" in cur or "/post/create" not in cur:
+                            saved = True
+                            break
+                        try:
+                            if not await publish_btn.count() or not await publish_btn.is_visible():
+                                saved = True
+                                break
+                        except Exception:
+                            saved = True
+                            break
+                    if not saved:
+                        raise Exception("保存草稿后 10s 页面未变化")
                     tencent_logger.success(_msg("🥳", "视频草稿保存成功"))
                 else:
                     # 发表成功后视频号可能跳 /platform（首页）、/post/list 或留在 create 页但按钮消失。
