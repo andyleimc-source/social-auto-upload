@@ -361,30 +361,71 @@ class DouYinBaseUploader(BaseVideoUploader):
             self.publish_date = 0
 
     async def set_schedule_time_douyin(self, page, publish_date):
+        # 抖音用字节 Semi Design 的 dateTime 选择器：日期和时间是两个视图，靠
+        # .semi-datepicker-switch-time 切换，dateTime 模式需手动点「确定」(needConfirm)。
+        # 往输入框敲文本+回车只能设日期，HH:MM 会被丢弃、整体回落到默认值(当前+2h)
+        # ——上游 issue #142 的病根。必须走面板：点日期格 → 切时间滚轮 → 选时/分 → 确定。
+        # (参考 DevilJie/social-auto-upload-web-ui 的 _set_schedule_time 实现)
         label_element = page.locator("[class^='radio']:has-text('定时发布')")
         await label_element.click()
         await asyncio.sleep(1)
         publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
 
         date_input = page.locator('.semi-input[placeholder="日期和时间"]')
-        for attempt in range(3):
-            await asyncio.sleep(1)
-            await date_input.click()
-            await page.keyboard.press("Control+KeyA")
-            await page.keyboard.type(str(publish_date_hour))
+        await date_input.click()
+        await asyncio.sleep(1)
+
+        # 1. 点日期格(title=YYYY-MM-DD)；不在当前面板则翻一页再找(定时窗口最多7天，跨月最多一页)
+        iso_date = publish_date.strftime("%Y-%m-%d")
+        day_cell = page.locator(
+            f'.semi-datepicker-day:not(.semi-datepicker-day-disabled)[title="{iso_date}"]'
+        )
+        if not await day_cell.count():
+            next_month_btn = page.locator('.semi-datepicker-navigation button').last
+            if await next_month_btn.count():
+                await next_month_btn.click()
+                await asyncio.sleep(0.5)
+        if await day_cell.count():
+            await day_cell.first.click()
+            douyin_logger.info(_msg("📅", f"日期已选择: {iso_date}"))
+        else:
+            raise RuntimeError(f"定时发布日历里找不到可选日期 {iso_date}(超出平台允许窗口或面板结构变化)")
+        await asyncio.sleep(0.5)
+
+        # 2. 切到时间滚轮，分别点小时/分钟
+        switch_time = page.locator('.semi-datepicker-switch-time')
+        if not await switch_time.count():
+            raise RuntimeError("找不到时间切换开关 .semi-datepicker-switch-time，抖音日期控件可能改版了")
+        await switch_time.first.click()
+        await asyncio.sleep(1)
+
+        hour = publish_date.strftime("%H")
+        hour_item = page.locator('.semi-scrolllist-item-wheel.undefined-list-hour li').filter(has_text=hour)
+        if not await hour_item.count():
+            raise RuntimeError(f"时间滚轮里找不到小时项 {hour}")
+        await hour_item.first.click()
+        await asyncio.sleep(0.4)
+
+        minute = publish_date.strftime("%M")
+        minute_item = page.locator('.semi-scrolllist-item-wheel.undefined-list-minute li').filter(has_text=minute)
+        if not await minute_item.count():
+            raise RuntimeError(f"时间滚轮里找不到分钟项 {minute}")
+        await minute_item.first.click()
+        await asyncio.sleep(0.4)
+
+        # 3. dateTime 模式需点「确定」提交；找不到按钮时回车兜底
+        confirm_btn = page.locator('.semi-popover button:has-text("确定")')
+        if await confirm_btn.count():
+            await confirm_btn.first.click()
+        else:
             await page.keyboard.press("Enter")
-            await asyncio.sleep(1)
-            # Semi 的日历浮层不点掉，会挡住后面的发布按钮，且未 blur 的值可能不会真正提交
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.5)
-            actual_value = await date_input.input_value()
-            if actual_value.strip() == publish_date_hour:
-                douyin_logger.success(_msg("🥳", f"定时发布时间已确认写入: {actual_value}"))
-                return
-            douyin_logger.warning(
-                _msg("⚠️", f"定时发布时间填入后校验不一致(期望 {publish_date_hour}，实际 {actual_value})，重试第 {attempt + 1} 次")
-            )
-        raise RuntimeError(f"定时发布时间始终没能正确写入，最后一次实际值: {actual_value!r}，期望值: {publish_date_hour!r}")
+        await asyncio.sleep(1)
+
+        # 4. 读回校验，不一致直接报错（不重试、不带错误值去发布）
+        actual_value = (await date_input.input_value()).strip()
+        if actual_value != publish_date_hour:
+            raise RuntimeError(f"定时发布时间校验失败，输入框值 {actual_value!r}，期望 {publish_date_hour!r}")
+        douyin_logger.success(_msg("🥳", f"定时发布时间已确认写入: {actual_value}"))
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
