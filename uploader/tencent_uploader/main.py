@@ -664,7 +664,15 @@ class TencentBaseUploader(BaseVideoUploader):
         expect_time = f"{hour}:{minute}"
         body_text = await page.evaluate("() => document.body.innerText")
         if expect_time not in body_text:
-            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，页面文本里找不到 {expect_time!r}")
+            # 失败必须留现场：截图 + 页面文本，下次修 bug 拿证据不靠猜
+            shot = os.path.join(BASE_DIR, "cookies", "tencent_schedule_failure.png")
+            try:
+                await page.screenshot(path=shot, full_page=True)
+                with open(shot.replace(".png", ".txt"), "w") as f:
+                    f.write(body_text)
+            except Exception:
+                pass
+            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，页面文本里找不到 {expect_time!r}；现场截图: {shot}")
         tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {expect_time}"))
 
     async def open_upload_page(self, page: Page) -> None:
