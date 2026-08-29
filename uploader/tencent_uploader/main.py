@@ -549,6 +549,61 @@ class TencentBaseUploader(BaseVideoUploader):
         return output_path
 
     async def set_schedule_time_tencent(self, page: Page, publish_date: datetime):
+        # 视频号发布页已改版：新版是「定时发表」开关(role=switch) + dateTimeSelect 触发的
+        # 三列滚动面板(日期/时/分, itemWrap)，分钟可精确选；旧版是 weui-desktop 日历 +
+        # 时间下拉(只吃小时，分钟会被丢弃——11:45 会变 11:00)。
+        # 先走新版，找不到再落回旧版；最后读回校验，对不上直接报错，绝不带错时间发表。
+        # (新版选择器参考 DevilJie/social-auto-upload-web-ui tencent_video/platform.py)
+        if await self._set_schedule_new_ui(page, publish_date):
+            return
+        tencent_logger.info(_msg("🧭", "新版定时控件未命中，尝试旧版 weui 日历"))
+        await self._set_schedule_old_ui(page, publish_date)
+
+    async def _set_schedule_new_ui(self, page: Page, publish_date: datetime) -> bool:
+        switch = page.locator('button[role="switch"]').first
+        if not await switch.count():
+            return False
+        if await switch.get_attribute("aria-checked") != "true":
+            await switch.click()
+            await asyncio.sleep(1)
+
+        trigger = page.locator('div[class*="dateTimeSelect"]').first
+        if not await trigger.count():
+            return False
+        await trigger.click()
+        await asyncio.sleep(1)
+
+        popup = page.locator('div[class*="popupWrap"]').first
+        if not await popup.count():
+            return False
+
+        # 三列滚动：日期(YYYY-MM-DD) / 时(H时) / 分(M分)——时分不补零
+        for text, col in [
+            (publish_date.strftime("%Y-%m-%d"), "日期"),
+            (f"{publish_date.hour}时", "小时"),
+            (f"{publish_date.minute}分", "分钟"),
+        ]:
+            item = popup.locator(f'div[class*="itemWrap"]:has-text("{text}")').first
+            if not await item.count():
+                raise RuntimeError(f"视频号定时面板找不到{col}项 {text!r}(可能超出可选范围或控件又改版)")
+            await item.click()
+            await asyncio.sleep(0.3)
+
+        confirm_btn = popup.locator('button:has-text("确定")').first
+        if await confirm_btn.count():
+            await confirm_btn.click()
+        await asyncio.sleep(1)
+
+        # 读回校验：触发器上应显示选定的日期与时间
+        shown = (await trigger.inner_text()).strip()
+        expect_date = publish_date.strftime("%Y-%m-%d")
+        expect_time = f"{publish_date.hour:02d}:{publish_date.minute:02d}"
+        if expect_date not in shown or expect_time not in shown:
+            raise RuntimeError(f"视频号定时时间校验失败，页面显示 {shown!r}，期望含 {expect_date} {expect_time}")
+        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {shown}"))
+        return True
+
+    async def _set_schedule_old_ui(self, page: Page, publish_date: datetime):
         label_element = page.locator("label").filter(has_text="定时").nth(1)
         await label_element.click()
         await page.click('input[placeholder="请选择发表时间"]')
@@ -567,16 +622,24 @@ class TencentBaseUploader(BaseVideoUploader):
                 await element.click()
                 break
 
-        await page.click('input[placeholder="请选择时间"]')
+        time_input = page.locator('input[placeholder="请选择时间"]')
+        await time_input.click()
         await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(publish_date.strftime("%H"))
-        await page.keyboard.press("Enter")  # 确认小时并关闭时间下拉
+        # 旧版这里原先只敲小时，分钟被丢弃(11:45 → 11:00)；改敲完整 HH:MM
+        await page.keyboard.type(publish_date.strftime("%H:%M"))
+        await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
         # 收起时间选择浮层：直接点描述区可能被 weui-desktop-dialog 遮挡，做容错
         try:
             await page.locator("div.input-editor").click(timeout=5000)
         except Exception:
             await page.keyboard.press("Escape")
+        # 读回校验，分钟对不上就报错(旧版下拉可能只有整点/半点档位)
+        actual = (await time_input.input_value()).strip()
+        expect_time = publish_date.strftime("%H:%M")
+        if actual != expect_time:
+            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，输入框值 {actual!r}，期望 {expect_time!r}")
+        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {actual}"))
 
     async def open_upload_page(self, page: Page) -> None:
         # 视频号已改版：直接全页加载 /platform/post/create 会被跳回 /platform 首页，
