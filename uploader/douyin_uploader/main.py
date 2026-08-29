@@ -366,12 +366,25 @@ class DouYinBaseUploader(BaseVideoUploader):
         await asyncio.sleep(1)
         publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
 
-        await asyncio.sleep(1)
-        await page.locator('.semi-input[placeholder="日期和时间"]').click()
-        await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(str(publish_date_hour))
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+        date_input = page.locator('.semi-input[placeholder="日期和时间"]')
+        for attempt in range(3):
+            await asyncio.sleep(1)
+            await date_input.click()
+            await page.keyboard.press("Control+KeyA")
+            await page.keyboard.type(str(publish_date_hour))
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(1)
+            # Semi 的日历浮层不点掉，会挡住后面的发布按钮，且未 blur 的值可能不会真正提交
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+            actual_value = await date_input.input_value()
+            if actual_value.strip() == publish_date_hour:
+                douyin_logger.success(_msg("🥳", f"定时发布时间已确认写入: {actual_value}"))
+                return
+            douyin_logger.warning(
+                _msg("⚠️", f"定时发布时间填入后校验不一致(期望 {publish_date_hour}，实际 {actual_value})，重试第 {attempt + 1} 次")
+            )
+        raise RuntimeError(f"定时发布时间始终没能正确写入，最后一次实际值: {actual_value!r}，期望值: {publish_date_hour!r}")
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
@@ -1068,7 +1081,9 @@ class DouYinVideo(DouYinBaseUploader):
             await self.set_schedule_time_douyin(page, self.publish_date)
 
         sms_prompt_logged = False
-        while True:
+        max_publish_attempts = 30  # 约 15~30 秒；超过这个次数说明卡在某个持续性错误(如时间校验)上，不能无限重试
+        last_toast_text = ""
+        for publish_attempt in range(max_publish_attempts):
             try:
                 # 移除会拦截发布按钮点击的新手引导/话题下拉浮层
                 await page.evaluate(
@@ -1104,10 +1119,21 @@ class DouYinVideo(DouYinBaseUploader):
                 break
             except Exception:
                 await self.handle_auto_video_cover(page)
-                douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
+                # Semi 的错误提示 toast，抓下来才知道到底卡在哪一步（而不是死循环瞎点）
+                toast_locator = page.locator('[class*="toast"], [class*="Toast"]')
+                if await toast_locator.count():
+                    try:
+                        last_toast_text = (await toast_locator.first.inner_text()).strip()
+                    except Exception:
+                        pass
+                douyin_logger.info(_msg("🏃", f"小人正在冲刺发布视频(第 {publish_attempt + 1}/{max_publish_attempts} 次)" + (f"，页面提示: {last_toast_text}" if last_toast_text else "")))
+                await page.screenshot(path=os.path.join(BASE_DIR, "cookies", "douyin_publish_last_failure.png"), full_page=True)
                 await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"抖音发布按钮连续点击 {max_publish_attempts} 次仍未跳转成功，最后一次页面提示: {last_toast_text!r}；"
+                f"排查截图: {os.path.join(BASE_DIR, 'cookies', 'douyin_publish_last_failure.png')}"
+            )
 
         await context.storage_state(path=self.account_file)
         douyin_logger.success(_msg("🥳", "cookie 更新完毕"))
