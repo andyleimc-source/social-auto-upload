@@ -659,12 +659,16 @@ class TencentBaseUploader(BaseVideoUploader):
             await page.keyboard.press("Escape")
         await page.wait_for_timeout(500)
 
-        # 读回校验（只认可见那份 input），对不上就报错退出
-        actual = (await time_dl.locator('input[placeholder="请选择时间"]').input_value()).strip()
+        # 读回校验：面板收起后组件可能整体重渲染，旧 locator 会失效，
+        # 改用 JS 直接扫全页该 placeholder 的输入框取值
+        values = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('input[placeholder="请选择时间"]'))
+                       .map(i => (i.value || '').trim()).filter(Boolean)"""
+        )
         expect_time = f"{hour}:{minute}"
-        if actual != expect_time:
-            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，输入框值 {actual!r}，期望 {expect_time!r}")
-        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {actual}"))
+        if expect_time not in values:
+            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，页面时间框值 {values!r}，期望 {expect_time!r}")
+        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {expect_time}"))
 
     async def open_upload_page(self, page: Page) -> None:
         # 视频号已改版：直接全页加载 /platform/post/create 会被跳回 /platform 首页，
