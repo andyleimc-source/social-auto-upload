@@ -673,7 +673,15 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         await page.wait_for_timeout(3000)
 
         # 2. 弹窗里直接就有图片 file input，不再有「上传封面」tab
+        # 弹窗有两种形态：视频处理出「封面推荐」后会多出「推荐 / 上传」两个页签，
+        # 这时图片输入框要点了「上传」才渲染；没有推荐时输入框直接就在。
+        # 2026-08-30 实测：漏掉这一步会在找输入框那里干等 60 秒然后超时。
         file_input = page.locator('input[type="file"][accept*="image"]').last
+        if not await file_input.count():
+            upload_tab = page.locator("div.d-modal").get_by_text("上传", exact=True).first
+            if await upload_tab.count():
+                await upload_tab.click()
+                await pacing.pause("in_cover_dialog", "xiaohongshu")
         try:
             await file_input.wait_for(state="attached", timeout=60000)
         except Exception:
