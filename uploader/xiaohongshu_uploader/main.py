@@ -629,11 +629,25 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         # LM-002 就这么带着首帧发了，不翻日志根本发现不了。封面是小红书瀑布流的主要点击来源，
         # 设不上等于白做，宁可当场失败让人重跑。
         cover_preview = page.locator("div.cover-plugin-preview div.cover div.default").first
+        # 这一步紧跟在填标题后面，此时视频往往还在上传，封面区要等一会儿才渲染出来。
+        # 不等就 hover，会一路空转到找图片输入框那步才超时（2026-08-30 实测）。
+        await cover_preview.wait_for(state="visible", timeout=120000)
         try:
             await cover_preview.scroll_into_view_if_needed(timeout=5000)
         except Exception:
             pass
-        await page.wait_for_timeout(1500)
+
+        # 必须等视频真的传完再动封面。上传等待循环有个兜底分支「没看到预览区但标题框出来了
+        # 就往下走」，实测视频刚开始传 2 秒它就 break 了；这时封面弹窗还是「视频加载中」，
+        # 里面的图片 input 根本没渲染，于是卡在找输入框那步超时（2026-08-30 实测两次）。
+        # 判据用缩略图的首帧背景图：它只有在视频处理出来之后才有值。
+        for _ in range(90):
+            if await cover_preview.evaluate("el => el.style.backgroundImage") not in ("", "none"):
+                break
+            await page.wait_for_timeout(2000)
+        else:
+            raise RuntimeError("等了 180 秒视频仍未处理完（封面缩略图一直是空的），没法设封面")
+        await page.wait_for_timeout(2000)
 
         # 设封面前先记下缩略图的背景图，最后拿它做读回校验（换了才算真的设上）
         before_bg = await cover_preview.evaluate("el => el.style.backgroundImage")
@@ -646,11 +660,30 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         entry = page.locator("div.cover-edit-entry").first
         await entry.wait_for(state="visible", timeout=10000)
         await entry.click()
+        # 等弹窗真的开出来再找输入框，别只靠固定 sleep
+        await page.locator("div.d-modal").first.wait_for(state="visible", timeout=30000)
         await page.wait_for_timeout(3000)
 
         # 2. 弹窗里直接就有图片 file input，不再有「上传封面」tab
         file_input = page.locator('input[type="file"][accept*="image"]').last
-        await file_input.wait_for(state="attached", timeout=10000)
+        try:
+            await file_input.wait_for(state="attached", timeout=60000)
+        except Exception:
+            # 留现场：截图 + 弹窗文本 + 页面上所有 file input 的 accept，
+            # 下次排查不用再靠猜弹窗当时是什么状态
+            shot = os.path.join(BASE_DIR, "cookies", "xiaohongshu_cover_failure.png")
+            detail = ""
+            try:
+                await page.screenshot(path=shot, full_page=True)
+                detail = await page.evaluate(
+                    "() => JSON.stringify({modal:(document.querySelector('.d-modal')||{}).innerText||'无弹窗',"
+                    "inputs:[...document.querySelectorAll('input[type=file]')].map(i=>i.accept)})"
+                )
+                with open(shot.replace(".png", ".txt"), "w") as f:
+                    f.write(detail)
+            except Exception:
+                pass
+            raise RuntimeError(f"封面弹窗里找不到图片上传输入框；{detail[:300]}；现场截图: {shot}")
         await file_input.set_input_files(thumbnail_path)
         await page.wait_for_timeout(5000)  # 等图片加载+裁剪渲染
 
