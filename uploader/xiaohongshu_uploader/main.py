@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
@@ -349,6 +349,22 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         await time_input.fill(str(publish_date_hour))
         await asyncio.sleep(1)
 
+        # 填完必须把日期面板关掉：fill 会让日历浮层保持展开，浮层没收起时页面底部的
+        # 「定时发布」按钮一直是 disabled（实测 2026-08-30：按钮可见=True 可点=False，
+        # 点 20 次全部超时，日志只刷「正在冲刺发布视频」）。回车提交 + Esc 收面板，
+        # 然后读回输入框校验，值不对就当场报错，不带着错的时间往下发。
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(0.5)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        actual = (await time_input.input_value()).strip()
+        if not actual.startswith(publish_date_hour):
+            raise RuntimeError(
+                f"小红书定时时间校验失败，输入框值 {actual!r}，期望 {publish_date_hour!r}"
+            )
+        xiaohongshu_logger.success(_msg("🥳", f"定时发布时间已确认写入: {publish_date_hour}"))
+
     async def set_location(self, page: Page, location: str = "青岛市"):
         if not location:
             return True
@@ -685,12 +701,16 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
+        # 点发布按钮重试有上限：原来是 while True 无限点，按钮一旦点不动就永远卡着，
+        # 日志只刷「小人正在冲刺发布视频」，既不成功也不报错，还留不下任何证据（实测
+        # 2026-08-30 卡了 5 分钟）。改成有限次 + 失败留现场，跟视频号那边同一套路。
+        btn_text = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
             try:
-                if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
-                    await page.locator('button:has-text("定时发布")').click()
-                else:
-                    await page.locator('button:has-text("发布")').click()
+                # 显式 5 秒超时：默认 30 秒会让「按钮点不动」这件事看起来像卡死，
+                # 光等 20 次就要 10 分钟，证据迟迟落不了盘。
+                await page.locator(f'button:has-text("{btn_text}")').click(timeout=5000)
                 await page.wait_for_url(
                     XHS_PUBLISH_SUCCESS_URL_PATTERN,
                     timeout=3000
@@ -698,10 +718,31 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
             except Exception:
-                xiaohongshu_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
-                if self.debug:
-                    await page.screenshot(full_page=True)
+                xiaohongshu_logger.info(_msg("🏃", f"小人正在冲刺发布视频（第 {attempt}/{max_attempts} 次）"))
                 await asyncio.sleep(0.5)
+        else:
+            # 失败必须留现场：截图 + 页面文本 + 按钮状态，下次修 bug 拿证据不靠猜
+            shot = os.path.join(BASE_DIR, "cookies", "xiaohongshu_publish_failure.png")
+            detail = ""
+            try:
+                btn = page.locator(f'button:has-text("{btn_text}")')
+                detail = (
+                    f"按钮数量={await btn.count()} "
+                    f"可见={await btn.first.is_visible()} "
+                    f"可点={await btn.first.is_enabled()}"
+                )
+            except Exception as exc:
+                detail = f"按钮状态读取失败: {exc}"
+            try:
+                await page.screenshot(path=shot, full_page=True)
+                body_text = await page.evaluate("() => document.body.innerText")
+                with open(shot.replace(".png", ".txt"), "w") as f:
+                    f.write(f"{detail}\n\n{body_text}")
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"小红书点「{btn_text}」{max_attempts} 次都没跳转成功；{detail}；现场截图: {shot}"
+            )
 
     async def upload(self, playwright: Playwright) -> None:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
