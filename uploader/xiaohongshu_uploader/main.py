@@ -340,6 +340,42 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         else:
             self.publish_date = 0
 
+    async def _await_scan_verification(self, page: Page, timeout_sec: int = 300) -> bool:
+        """点发布后若弹出「扫码验证」风控关卡，挂起等真人用小红书 APP 扫码。
+
+        绝不自动重试或试图绕过风控——只是把浏览器窗口留着、把提示打到终端上，
+        等人扫完。扫完页面会跳到发布成功页，返回 True；超时返回 False，
+        交由调用方留现场退出。
+        """
+        try:
+            if "扫码验证" not in await page.evaluate("() => document.body.innerText"):
+                return False
+        except Exception:
+            return False
+
+        xiaohongshu_logger.warning(_msg(
+            "📱", f"小红书弹出扫码验证：请用「雷码工坊」account 登录的小红书 APP 扫描浏览器窗口里的二维码"
+        ))
+        xiaohongshu_logger.warning(_msg("⏳", f"最多等 {timeout_sec} 秒；二维码过期会自动刷新，重新扫即可"))
+
+        deadline = asyncio.get_event_loop().time() + timeout_sec
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(3)
+            try:
+                if "/publish/success" in page.url:
+                    return True
+                if "扫码验证" not in await page.evaluate("() => document.body.innerText"):
+                    # 关卡消失了：可能已扫完但还没跳页，再给页面一点时间
+                    try:
+                        await page.wait_for_url(XHS_PUBLISH_SUCCESS_URL_PATTERN, timeout=15000)
+                        return True
+                    except Exception:
+                        return False
+            except Exception:
+                continue
+        xiaohongshu_logger.warning(_msg("⌛", "等扫码超时，没人扫或扫了没通过"))
+        return False
+
     async def set_schedule_time_xiaohongshu(self, page: Page, publish_date: datetime):
         xiaohongshu_logger.info(_msg("🕒", f"小人准备设置定时发布时间: {publish_date.strftime(self.date_format)}"))
         await page.locator('.custom-switch-card').filter(has_text="定时发布").locator('.d-switch').click()
@@ -718,6 +754,12 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 xiaohongshu_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                 break
             except Exception:
+                # 小红书会在点发布后弹「扫码验证」风控关卡（要求用本账号的小红书 APP
+                # 扫码验证身份）。这是人工环节，脚本绝不重试绕过：挂起等真人扫，
+                # 扫完页面自己跳走就算成功；等超时就照常留现场退出，交人处理。
+                if await self._await_scan_verification(page):
+                    xiaohongshu_logger.success(_msg("🥳", "扫码验证已通过，视频发布成功"))
+                    break
                 xiaohongshu_logger.info(_msg("🏃", f"小人正在冲刺发布视频（第 {attempt}/{max_attempts} 次）"))
                 await asyncio.sleep(0.5)
         else:
