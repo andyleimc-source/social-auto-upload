@@ -624,58 +624,63 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         xiaohongshu_logger.info(_msg("🖼️", "小人准备设置封面"))
 
-        # 封面设置为增强步骤：失败时记 warning 跳过、继续发布（用视频首帧兜底）。
+        # 封面失败一律硬退出，绝不静默降级。
+        # 2026-08-30 教训：老代码把封面当「增强步骤」，失败只打 WARNING 就用视频首帧发出去，
+        # LM-002 就这么带着首帧发了，不翻日志根本发现不了。封面是小红书瀑布流的主要点击来源，
+        # 设不上等于白做，宁可当场失败让人重跑。
+        cover_preview = page.locator("div.cover-plugin-preview div.cover div.default").first
         try:
-            # 发布页封面区域内嵌，点击 div.upload-cover 打开封面弹窗（d-modal）。
-            cover_section = page.locator("text=设置封面").first
+            await cover_preview.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(1500)
+
+        # 设封面前先记下缩略图的背景图，最后拿它做读回校验（换了才算真的设上）
+        before_bg = await cover_preview.evaluate("el => el.style.backgroundImage")
+
+        # 1. 「编辑封面」入口平时是隐藏的，必须先 hover 缩略图才会出现。
+        #    老代码点的 div.upload-cover / div.default.pointer 都已不存在
+        #    （类名现在是 default row），点不到才导致整步失败。
+        await cover_preview.hover()
+        await page.wait_for_timeout(800)
+        entry = page.locator("div.cover-edit-entry").first
+        await entry.wait_for(state="visible", timeout=10000)
+        await entry.click()
+        await page.wait_for_timeout(3000)
+
+        # 2. 弹窗里直接就有图片 file input，不再有「上传封面」tab
+        file_input = page.locator('input[type="file"][accept*="image"]').last
+        await file_input.wait_for(state="attached", timeout=10000)
+        await file_input.set_input_files(thumbnail_path)
+        await page.wait_for_timeout(5000)  # 等图片加载+裁剪渲染
+
+        # 3. 确认按钮是「完成」，不是「确定」
+        confirm = page.locator("div.d-modal").get_by_text("完成", exact=True).first
+        if not await confirm.count():
+            confirm = page.get_by_role("button", name="完成").first
+        await confirm.wait_for(state="visible", timeout=10000)
+        await confirm.click()
+
+        # 4. 等弹窗关闭
+        try:
+            await page.locator("div.d-modal").first.wait_for(state="hidden", timeout=20000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(2000)
+
+        # 5. 读回校验：缩略图背景图必须变了。不校验的话，弹窗点完就走、
+        #    封面其实没换，日志照样报成功——跟 8-30 那次是同一类问题。
+        after_bg = await cover_preview.evaluate("el => el.style.backgroundImage")
+        if not after_bg or after_bg == before_bg:
+            shot = os.path.join(BASE_DIR, "cookies", "xiaohongshu_cover_failure.png")
             try:
-                await cover_section.scroll_into_view_if_needed(timeout=5000)
+                await page.screenshot(path=shot, full_page=True)
             except Exception:
                 pass
-            await page.wait_for_timeout(2000)
-
-            # 1. 点击 div.upload-cover 打开封面弹窗
-            upload_cover = page.locator("div.upload-cover").first
-            if not await upload_cover.count():
-                upload_cover = page.locator("div.cover-plugin-preview div.default.pointer").first
-            await upload_cover.click(force=True)
-            await page.wait_for_timeout(3000)
-
-            # 2. 切换到「上传封面」tab（默认在「截取封面」）
-            upload_tab = page.get_by_text("上传封面", exact=True).first
-            await upload_tab.wait_for(state="visible", timeout=10000)
-            await upload_tab.click()
-            await page.wait_for_timeout(2000)
-
-            # 3. 找到图片 file input（parent class: upload-wrapper）并上传
-            file_input = page.locator('div.upload-wrapper input[type="file"][accept*="image"]').first
-            if not await file_input.count():
-                file_input = page.locator('input[type="file"][accept*="image"]').last
-            await file_input.set_input_files(thumbnail_path)
-            await page.wait_for_timeout(4000)  # 等图片加载+裁剪渲染
-
-            # 4. 点「确定」按钮
-            modal_footer = page.locator("div.d-modal-footer")
-            confirm = modal_footer.get_by_text("确定", exact=True).first
-            if not await confirm.count():
-                confirm = page.get_by_role("button", name="确定").first
-            await confirm.wait_for(state="visible", timeout=10000)
-            await confirm.click()
-
-            # 5. 等弹窗关闭
-            modal = page.locator("div.d-modal")
-            try:
-                await modal.first.wait_for(state="hidden", timeout=15000)
-            except Exception:
-                pass
-            xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成"))
-        except Exception as exc:
-            xiaohongshu_logger.warning(_msg("🖼️", f"封面设置失败，跳过该步骤继续发布（用视频首帧）：{exc}"))
-            try:
-                await page.keyboard.press("Escape")
-                await page.wait_for_timeout(500)
-            except Exception:
-                pass
+            raise RuntimeError(
+                f"小红书封面设置未生效：缩略图仍是 {before_bg!r}；现场截图: {shot}"
+            )
+        xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成（已读回校验）"))
 
     async def upload_video_content(self, page: Page) -> None:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
