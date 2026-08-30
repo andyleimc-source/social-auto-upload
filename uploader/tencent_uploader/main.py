@@ -604,9 +604,18 @@ class TencentBaseUploader(BaseVideoUploader):
         return True
 
     async def _set_schedule_old_ui(self, page: Page, publish_date: datetime):
+        # 两个 label 依次是「不定时」「定时」，nth(1) 才是定时；不能按文本精确匹配
+        # (label 的 innerText 带空白，正则 ^定时$ 匹配不上，实测会直接超时)。
         label_element = page.locator("label").filter(has_text="定时").nth(1)
         await label_element.click()
-        await page.click('input[placeholder="请选择发表时间"]')
+        # 断言开关真的打开了：时间输入框只在「定时」选中后才出现。
+        # 不断言的话后面全在空转，最后才在读回那步报错，看不出是哪一步没生效。
+        time_input_sel = 'input[placeholder="请选择发表时间"]'
+        try:
+            await page.locator(time_input_sel).first.wait_for(state="visible", timeout=10000)
+        except Exception:
+            raise RuntimeError("点了「定时」但发表时间输入框没出现，定时开关没打开")
+        await page.click(time_input_sel)
 
         current_month = publish_date.strftime("%m月")
         page_month = await page.inner_text('span.weui-desktop-picker__panel__label:has-text("月")')
@@ -659,21 +668,34 @@ class TencentBaseUploader(BaseVideoUploader):
             await page.keyboard.press("Escape")
         await page.wait_for_timeout(500)
 
-        # 读回校验：选完时分收起面板后，组件会把输入框整个换成纯文本展示
-        # (实测输入框从 DOM 消失、扫 input 拿到空数组)，所以直接查页面文本
-        expect_time = f"{hour}:{minute}"
-        body_text = await page.evaluate("() => document.body.innerText")
-        if expect_time not in body_text:
-            # 失败必须留现场：截图 + 页面文本，下次修 bug 拿证据不靠猜
+        # 读回校验：直接读输入框的 value，不要查页面文本。
+        # 发布表单整个在 iframe(micro/content/post/create) 里，主文档 body.innerText
+        # 只有 55 个字符——老代码拿它做校验，时间永远"查不到"，于是每次都在这里报错退出。
+        # (2026-08-30 实测：page.locator 能跨 iframe 命中，page.evaluate 不能，只跑主文档。)
+        # 必须全等比对：输入框自带默认值(如 2026-08-30 15:00)，用"包含日期"之类的松校验
+        # 会在一次点击都没生效的情况下照样通过。
+        expect = f"{publish_date.strftime('%Y-%m-%d')} {hour}:{minute}"
+        time_input = page.locator('input[placeholder="请选择发表时间"]').first
+        actual = (await time_input.input_value()).strip()
+        if actual != expect:
+            # 失败必须留现场：截图 + iframe 里的页面文本，下次修 bug 拿证据不靠猜
             shot = os.path.join(BASE_DIR, "cookies", "tencent_schedule_failure.png")
             try:
                 await page.screenshot(path=shot, full_page=True)
+                texts = []
+                for fr in page.frames:
+                    try:
+                        texts.append(f"--- {fr.url}\n{await fr.evaluate('() => document.body.innerText')}")
+                    except Exception:
+                        pass
                 with open(shot.replace(".png", ".txt"), "w") as f:
-                    f.write(body_text)
+                    f.write("\n\n".join(texts))
             except Exception:
                 pass
-            raise RuntimeError(f"视频号(旧版控件)定时时间校验失败，页面文本里找不到 {expect_time!r}；现场截图: {shot}")
-        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {expect_time}"))
+            raise RuntimeError(
+                f"视频号定时时间校验失败，输入框值 {actual!r}，期望 {expect!r}；现场截图: {shot}"
+            )
+        tencent_logger.success(_msg("🥳", f"定时发表时间已确认写入: {actual}"))
 
     async def open_upload_page(self, page: Page) -> None:
         # 视频号已改版：直接全页加载 /platform/post/create 会被跳回 /platform 首页，
@@ -1094,6 +1116,10 @@ class TencentVideo(TencentBaseUploader):
         await self.validate_base_args()
         if not self.title or not str(self.title).strip():
             raise ValueError("视频模式下，title 是必须的")
+        # 平台自己的提示原话：「使用定时发表将无法保存草稿。若要保存草稿，需先取消定时发表。」
+        # 两者互斥，同时给会静默丢掉其中一个，提前拦下来。
+        if self.is_draft and self.publish_strategy == TENCENT_PUBLISH_STRATEGY_SCHEDULED:
+            raise ValueError("视频号的「定时发表」与「保存草稿」互斥，不能同时用：要么定时，要么存草稿")
         self.file_path = str(self.validate_video_file(self.file_path))
         if self.thumbnail_landscape_path:
             self.thumbnail_landscape_path = str(self.validate_image_file(self.thumbnail_landscape_path))
