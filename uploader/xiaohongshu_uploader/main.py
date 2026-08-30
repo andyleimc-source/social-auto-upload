@@ -14,6 +14,7 @@ from patchright.async_api import async_playwright
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils import pacing
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -461,8 +462,11 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             return False
 
     async def fill_title(self, page: Page) -> None:
+        await pacing.pause("before_title", "xiaohongshu")
         title_container = page.locator('input[placeholder*="填写标题"]')
-        await title_container.fill(self.title[:20])
+        # 用逐字输入代替 fill：fill 是一次性塞进去的，真人不会瞬间出现整行标题
+        await title_container.click()
+        await pacing.human_type(page, self.title[:20], "xiaohongshu")
 
     async def fill_desc(self, page: Page) -> None:
         if not getattr(self, "desc", ""):
@@ -473,7 +477,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         await page.keyboard.press("Backspace")
         await page.keyboard.press("Control+KeyA")
         await page.keyboard.press("Delete")
-        await page.keyboard.type(self.desc)
+        await pacing.pause("before_desc", "xiaohongshu")
+        await pacing.human_type(page, self.desc, "xiaohongshu")
         await page.keyboard.press("Enter")
 
     async def fill_tags(self, page: Page) -> None:
@@ -492,11 +497,13 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
             desc = page.locator('p[data-placeholder*="输入正文描述"]')
             await desc.click()
 
+        await pacing.pause("before_tags", "xiaohongshu")
         for tag in self.tags:  # 循环处理所有 tags
+            await pacing.pause("between_tags", "xiaohongshu")
             # 话题候选下拉框依赖小红书联想接口实时返回，网络抖动/无匹配时会等不到。
             # 标签是可选增强项：等不到候选框就跳过该标签继续，不让整条发布因此失败。
             try:
-                await page.keyboard.type("#" + tag, delay=30)
+                await page.keyboard.type("#" + tag, delay=pacing.type_delay("xiaohongshu"))
                 await page.locator('#creator-editor-topic-container').wait_for(
                     state="visible",
                     timeout=6000
@@ -622,6 +629,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if not thumbnail_path:
             return
 
+        await pacing.pause("before_cover", "xiaohongshu")
         xiaohongshu_logger.info(_msg("🖼️", "小人准备设置封面"))
 
         # 封面失败一律硬退出，绝不静默降级。
@@ -723,6 +731,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         )
         await page.goto(publish_url)
         await page.wait_for_url(publish_url)
+        await pacing.pause("page_ready", "xiaohongshu")
+        await pacing.pause("before_upload", "xiaohongshu")
         await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
 
         while True:
@@ -763,6 +773,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 xiaohongshu_logger.debug(_msg("😵", f"上传状态还没稳定下来，小人继续观察: {e}"))
             await asyncio.sleep(2)
 
+        await pacing.pause("after_upload", "xiaohongshu")
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
 
@@ -773,11 +784,13 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         await self.check_original_declaration(page)
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+            await pacing.pause("before_schedule", "xiaohongshu")
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
         # 点发布按钮重试有上限：原来是 while True 无限点，按钮一旦点不动就永远卡着，
         # 日志只刷「小人正在冲刺发布视频」，既不成功也不报错，还留不下任何证据（实测
         # 2026-08-30 卡了 5 分钟）。改成有限次 + 失败留现场，跟视频号那边同一套路。
+        await pacing.pause("before_submit", "xiaohongshu")
         btn_text = "定时发布" if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED else "发布"
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -927,6 +940,7 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         await self.check_original_declaration(page)
 
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+            await pacing.pause("before_schedule", "xiaohongshu")
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
         while True:

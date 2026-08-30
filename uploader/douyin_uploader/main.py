@@ -14,6 +14,7 @@ from patchright.async_api import async_playwright
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils import pacing
 from utils.login_qrcode import build_login_qrcode_path
 from utils.login_qrcode import decode_qrcode_from_path
 from utils.login_qrcode import print_terminal_qrcode
@@ -432,7 +433,9 @@ class DouYinBaseUploader(BaseVideoUploader):
         # version_2(post/video) 发布页要等视频上传完才渲染表单（实测约 40s），故等待超时给到 120s
         title_input = page.locator('input[placeholder*="填写作品标题"]').first
         await title_input.wait_for(state="visible", timeout=120000)
-        await title_input.fill(title[:30])
+        await pacing.pause("before_title", "douyin")
+        await title_input.click()
+        await pacing.human_type(page, title[:30], "douyin")
 
         description_editor = page.locator('div.zone-container[contenteditable="true"]').first
         await description_editor.wait_for(state="visible", timeout=120000)
@@ -442,10 +445,12 @@ class DouYinBaseUploader(BaseVideoUploader):
 
         # 先填正文描述，再填 #话题（此前 description 参数未被写入，导致抖音只有标签没有正文）
         if description and description.strip():
-            await page.keyboard.type(description.strip())
+            await pacing.pause("before_desc", "douyin")
+            await pacing.human_type(page, description.strip(), "douyin")
 
         for tag in tags or []:
-            await page.keyboard.type(" #" + tag)
+            await pacing.pause("between_tags", "douyin")
+            await page.keyboard.type(" #" + tag, delay=pacing.type_delay("douyin"))
             await page.keyboard.press("Space")
         await page.keyboard.press("Escape")  # 收起话题下拉，避免浮层拦截后续点击
 

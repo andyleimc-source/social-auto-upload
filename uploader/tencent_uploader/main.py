@@ -17,6 +17,7 @@ from patchright.async_api import async_playwright
 from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
+from utils import pacing
 from utils.log import tencent_logger
 
 TENCENT_LOGIN_URL = "https://channels.weixin.qq.com"
@@ -841,16 +842,19 @@ class TencentBaseUploader(BaseVideoUploader):
                 await page.wait_for_timeout(500)
         else:
             await page.locator("div.input-editor").click(timeout=8000)
-        await page.keyboard.type(self.title)
+        await pacing.pause("before_title", "tencent")
+        await pacing.human_type(page, self.title, "tencent")
         await page.keyboard.press("Enter")
         for tag in self.tags:
-            await page.keyboard.type("#" + tag)
+            await pacing.pause("between_tags", "tencent")
+            await page.keyboard.type("#" + tag, delay=pacing.type_delay("tencent"))
             await page.keyboard.press("Space")
         tencent_logger.info(_msg("🏷️", f"成功添加 hashtag: {len(self.tags)}"))
 
     async def fill_description(self, page: Page) -> None:
         await page.keyboard.press("Enter")
-        await page.keyboard.type(self.desc)
+        await pacing.pause("before_desc", "tencent")
+        await pacing.human_type(page, self.desc, "tencent")
         tencent_logger.info(_msg("🏷️", f"成功添加 desc: {len(self.desc)}"))
 
     async def apply_collection(self, page: Page) -> None:
